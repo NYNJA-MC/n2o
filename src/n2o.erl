@@ -23,11 +23,13 @@
 % START VNODE HASH RING
 
 stop(_)    -> catch n2o_vnode:unload(), ok.
-start(_,_) -> catch n2o_vnode:load([]), X = supervisor:start_link({local,n2o},n2o, []),
-              n2o_pi:start(#pi{module=?MODULE,table=caching,sup=n2o,state=[],name="timer"}),
-              [ n2o_pi:start(#pi{module=n2o_vnode,table=ring,sup=n2o,state=[],name=Pos})
-                || {{_,_},Pos} <- lists:zip(ring(),lists:seq(1,length(ring()))) ],
-                X.
+start(_,_) ->
+    n2o_vnode:load([]),
+    X = supervisor:start_link({local,n2o},n2o, []),
+    n2o_pi:start(#pi{module=?MODULE,table=caching,sup=n2o,state=[],name="timer"}),
+    [ n2o_pi:start(#pi{module=n2o_vnode,table=ring,sup=n2o,state=[],name=Pos})
+      || {{_,_},Pos} <- lists:zip(ring(),lists:seq(1,length(ring()))) ],
+    X.
 
 ring()         -> array:to_list(n2o_ring:ring()).
 rand_vnode()   -> rand:uniform(length(ring())).

@@ -2,7 +2,7 @@
              [{description,"N2O DAS MQTT TCP WebSocket"},
               {vsn,"6.4"},
               {license,"ISC"},
-              {applications,[kernel,stdlib]},
+              {applications,[kernel,stdlib,emqttd]},
               {modules,[]},
               {registered,[]},
               {mod,{n2o,[]}},
