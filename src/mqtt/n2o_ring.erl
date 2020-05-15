@@ -54,9 +54,9 @@ nodes()      -> [{Name, Opaque} || {Name, Opaque, _} <- get_config() ].
 lookup_index(KeyIndex) ->
     Ring = application:get_env(n2o,ring,[]),
     true = (KeyIndex >= 0) andalso (KeyIndex < 65536),
-    case bsearch(Ring, KeyIndex) of
-        empty -> [];
-        PartIdx -> {ring,PartIdx+1}
+    case array:sparse_size(Ring) of
+      0 -> [];
+      N -> {ring, 1 + KeyIndex rem N}
     end.
 
 set_opaque({Name, Opaque}) ->
@@ -122,43 +122,5 @@ partitions_from_ring(Ring) ->
     calc_partitions(ArrL, Idx, []).
 
 index1(Key) ->
-    <<A,B,_/bytes>> = erlang:md5(term_to_binary(Key)),
-    (A bsl 8 + B).
+    erlang:phash2(Key, 65536).
 
-bsearch(Arr, K) ->
-    Size =  array:sparse_size(Arr),
-    if Size == 0 -> empty; true -> bsearch(Arr, Size, 0, Size - 1, K) end.
-
-bsearch(Arr, Size, LIdx, RIdx, K) ->
-    MIdx = LIdx + (RIdx - LIdx + 1) div 2,
-    true = (MIdx >= LIdx) andalso (MIdx =< RIdx),
-    case key_fits(Arr, Size, MIdx - 1, MIdx, K) of
-        {yes, Idx} -> Idx;
-        {no, lt} -> bsearch(Arr, Size, LIdx, MIdx, K);
-        {no, gt} ->
-            if
-                MIdx == (Size - 1) -> Size - 1;
-                true -> bsearch(Arr, Size, MIdx, RIdx, K)
-            end
-    end.
-
-key_fits(_Arr, 1, -1, 0, _K) ->
-    {yes, 0};
-
-key_fits(Arr, Size, -1, 0, K) ->
-    {Hash0, _} = array:get(0, Arr),
-    {HashS, _} = array:get(Size - 1, Arr),
-    true = K < HashS,
-    if
-        K < Hash0 -> {yes, Size - 1};
-        true -> {no, gt}
-    end;
-
-key_fits(Arr, Size, L, R, K) ->
-    {LHash, _} = array:get(L, Arr),
-    {RHash, _} = array:get(R, Arr),
-    if
-        K < LHash -> if L == 0 -> {yes, Size - 1}; true -> {no, lt} end;
-        (K >= LHash) andalso (K < RHash) -> {yes, L};
-        K >= RHash -> {no, gt}
-    end.
