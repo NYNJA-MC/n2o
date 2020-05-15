@@ -46,9 +46,11 @@ fix(<<"index">>) -> index;
 fix(Module)      -> list_to_atom(binary_to_list(Module)).
 
 lst(X) -> binary_to_list(n2o:to_binary(X)).
+
 gen_name(Pos) when is_integer(Pos) -> gen_name(integer_to_list(Pos));
-gen_name(Pos) -> n2o:to_binary([lists:flatten([io_lib:format("~2.16.0b",[X])
-              || <<X:8>> <= list_to_binary(atom_to_list(node())++"_"++Pos)])]).
+gen_name(Pos) ->
+    Hash = erlang:phash2(node()),
+    iolist_to_binary(io_lib:format("~8.16.0b_~s", [Hash, Pos])).
 
 proc(init,#pi{name=Name}=Async) ->
     n2o:info(?MODULE,"VNode Init: ~p\r~n",[Name]),
@@ -77,6 +79,7 @@ proc({publish, To, Request},
                end,
         Ctx  = #cx { module=fix(Module), session=Sid, node=Node,
                      params=Id, client_pid=C, from = From, vsn = Vsn},
+        n2o:info(?MODULE, "n2o(~p): RECV PUBLISH(Topic=~s, Hash=0x~8.16.0b, Payload=~p)", [Name, To, erlang:phash2(Request), Bert]),
         put(context, Ctx),
         try case n2o_proto:info(Bert,[],Ctx) of
                  {reply,{_,      <<>>},_,_}           -> skip;
