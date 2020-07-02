@@ -83,7 +83,7 @@ proc({publish, To, Request},
         put(context, Ctx),
         try case n2o_proto:info(Bert,[],Ctx) of
                  {reply,{_,      <<>>},_,_}           -> skip;
-                 {reply,{bert,   Term},_,#cx{from=X}} -> {ok,send(C,X,n2o_bert:encode(Term))};
+                 {reply,{bert,   Term},_,#cx{from=X}} -> {ok, reply(Name, C, X, Term)};
                  {reply,{json,   Term},_,#cx{from=X}} -> {ok,send(C,X,n2o_json:encode(Term))};
                  {reply,{binary, Term},_,#cx{from=X}} -> {ok,send(C,X,Term)};
                  {reply,{default,Term},_,#cx{from=X}} -> {ok,send(C,X,n2o:encode(Term))};
@@ -105,6 +105,10 @@ proc(Unknown,Async) ->
     {reply,{uknown,Unknown,0},Async}.
 
 % MQTT HELPERS
+
+reply(N2OName, MqttClient, Topic, Response) ->
+    n2o:info(?MODULE, "n2o(~p): SEND PUBLISH(Topic=~s, Payload=~p)", [N2OName, Topic, Response]),
+    send(MqttClient, Topic, n2o_bert:encode(Response)).
 
 subscribe(X,Y) -> subscribe(X,Y,[{qos,2}]).
 subscribe(X,Y,[{qos,Z}]) -> subscribe_cli(X,[{Y,Z}]).
