@@ -117,7 +117,7 @@ unsubscribe(X,Y) -> unsubscribe(X,Y,[{qos,2}]).
 unsubscribe(X,Y,[{qos,Z}]) -> unsubscribe_cli(X,[{Y,Z}]).
 
 subscribe_cli(ClientId, TopicTable) ->
-    [ emqttd_pubsub:add_subscriber(Topic,ClientId,[{qos,Qos}])
+    [ emqttd_pubsub:subscribe(Topic,ClientId,[{qos,Qos}])
       || {Topic,Qos} <- TopicTable ].
 
 unsubscribe_cli(ClientId, TopicTable)->
