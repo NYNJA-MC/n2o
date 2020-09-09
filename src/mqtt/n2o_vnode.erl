@@ -117,24 +117,16 @@ unsubscribe(X,Y) -> unsubscribe(X,Y,[{qos,2}]).
 unsubscribe(X,Y,[{qos,Z}]) -> unsubscribe_cli(X,[{Y,Z}]).
 
 subscribe_cli(ClientId, TopicTable) ->
-    [ begin
-        kvs:put({mqtt_subscription, ClientId, Topic}),
-        kvs:put({mqtt_subproperty, {Topic, ClientId}, [{qos,Qos}]}),
-        emqttd_pubsub:add_subscriber(Topic,ClientId,[{qos,Qos}])
-      end || {Topic,Qos} <- TopicTable ].
+    [ emqttd_pubsub:subscribe(Topic,ClientId,[{qos,Qos}])
+      || {Topic,Qos} <- TopicTable ].
 
 unsubscribe_cli(ClientId, TopicTable)->
-    DelFun = fun() -> [ begin
-             mnesia:delete_object({mqtt_subscription, ClientId, Topic}),
-             kvs:delete(mqtt_subproperty, {Topic, ClientId}),
-             mnesia:delete_object({mqtt_subscriber, Topic, ClientId})
-            end || {Topic,_Qos} <- TopicTable ] end,
-    case mnesia:is_transaction() of
-        true  -> DelFun();
-        false -> mnesia:transaction(DelFun)
-    end,
-    [(not ets:member(mqtt_subscriber, Topic)) andalso
-      emqttd_router:del_route(Topic) || {Topic,_Qos} <- TopicTable ].
+    [case ets:lookup(mqtt_subproperty, {Topic, ClientId}) of
+         [{mqtt_subproperty, _, Options}] ->
+             emqttd_pubsub:unsubscribe(Topic, ClientId, Options);
+         [] ->
+             ok
+     end || {Topic,_Qos} <- TopicTable ].
 
 % MQTT HOOKS
 
