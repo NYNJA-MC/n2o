@@ -5,7 +5,7 @@
 -include("n2o.hrl").
 -include("n2o_core.hrl").
 -include("n2o_api.hrl").
--export([start/2, stop/1, init/1, proc/2, version/0, ring/0, to_binary/1, bench/0]).
+-export([start/2, stop/1, init/1, proc/2, version/0, ring/0, to_binary/1]).
 
 % SERVICES
 
@@ -25,36 +25,27 @@
 stop(_)    -> catch n2o_vnode:unload(), ok.
 start(_,_) ->
     n2o_vnode:load([]),
-    X = supervisor:start_link({local,n2o},n2o, []),
-    n2o_pi:start(#pi{module=?MODULE,table=caching,sup=n2o,state=[],name="timer"}),
-    [ n2o_pi:start(#pi{module=n2o_vnode,table=ring,sup=n2o,state=[],name=Pos})
-      || {{_,_},Pos} <- lists:zip(ring(),lists:seq(1,length(ring()))) ],
-    X.
+    n2o_ring:init([{node(), 1, 4}]),
+    Sup    = supervisor:start_link({local, n2o}, n2o, []),
+    VNodes = [ #pi{module = n2o_vnode, table = ring, sup = n2o, state = [], name = Pos}
+               || Pos <- lists:seq(1, length(ring()))],
+    Timer  = #pi{module = ?MODULE, table = caching, sup = n2o, state = [], name = "timer"},
+    lists:foreach(fun(Pi) -> n2o_pi:start(Pi) end, [Timer] ++ VNodes),
+    Sup.
 
-ring()         -> array:to_list(n2o_ring:ring()).
-rand_vnode()   -> rand:uniform(length(ring())).
-opt()          -> [ set, named_table, { keypos, 1 }, public ].
-tables()       -> application:get_env(n2o,tables,[ cookies, file, caching, ring, async ]).
-storage_init() -> [ ets:new(X,opt()) || X <- tables() ].
-init([])       -> storage_init(),
-                  n2o_ring:init([{node(),1,4}]),
-                  { ok, { { one_for_one, 1000, 10 }, [] } }.
+%% Supervisor init callback
+init([]) ->
+    init_storage(),
+    { ok, { { one_for_one, 1000, 10 }, [] } }.
 
-% MQTT vs OTP benchmarks
+init_storage() ->
+    Defaults = [cookies, file, caching, ring, async],
+    Tables   = application:get_env(n2o,tables, Defaults),
+    EtsOpts  = [set, named_table, {keypos, 1}, public],
+    lists:foreach(fun(X) -> ets:new(X, EtsOpts) end, Tables).
 
-bench() -> [bench_mqtt(),bench_otp()].
-run()   -> 10000.
-
-bench_mqtt() -> N = run(), {T,_} = timer:tc(fun() -> [ begin Y = lists:concat([X rem 16]),
-    n2o_vnode:send_reply(<<"clientId">>,n2o:to_binary(["events/1/",Y]),term_to_binary(X))
-                               end || X <- lists:seq(1,N) ], ok end),
-           {mqtt,trunc(N*1000000/T),"msgs/s"}.
-
-bench_otp() -> N = run(), {T,_} = timer:tc(fun() ->
-     [ n2o_ring:send({publish, n2o:to_binary(["events/1/",
-              lists:concat([(X rem length(n2o:ring())) + 1]),"/index/anon/room/"]),
-                      term_to_binary(X)}) || X <- lists:seq(1,N) ], ok end),
-     {otp,trunc(N*1000000/T),"msgs/s"}.
+ring() ->
+    array:to_list(n2o_ring:ring()).
 
 % MQ
 
@@ -92,27 +83,37 @@ decode(Term) -> (formatter()):decode(Term).
 
 % CACHE
 
-cache(Tab, Key, Value, Till) -> ets:insert(Tab,{Key,Till,Value}), Value.
-cache(Tab, Key, undefined)   -> ets:delete(Tab,Key);
-cache(Tab, Key, Value)       -> ets:insert(Tab,{Key,n2o_session:till(calendar:local_time(),
-                                                    n2o_session:ttl()),Value}), Value.
 cache(Tab, Key) ->
-    Res = ets:lookup(Tab,Key),
-    Val = case Res of [] -> []; [Value] -> Value; Values -> Values end,
-    case Val of [] -> [];
-                {_,infinity,X} -> X;
-                {_,Expire,X} -> case Expire < calendar:local_time() of
-                                  true ->  ets:delete(Tab,Key), [];
-                                  false -> X end end.
+    Time = calendar:local_time(),
+    case ets:lookup(Tab, Key) of
+        [] -> [];
+        [{_, infinity, X}] -> X;
+        [{_, Expire, X}] when Expire >= Time -> X;
+        [{_, Expire, X}]  -> ets:delete(Tab, Key), [];
+        Values -> Values %% TODO: This seems wrong
+    end.
+
+cache(Tab, Key, undefined) ->
+    ets:delete(Tab, Key);
+cache(Tab, Key, Value) ->
+    Expire = n2o_session:till(calendar:local_time(), n2o_session:ttl()),
+    ets:insert(Tab,{Key, Expire, Value}),
+    Value.
+
+cache(Tab, Key, Value, Till) ->
+    ets:insert(Tab, {Key, Till, Value}), Value.
 
 % ERROR
 
 stack_trace(Error, Reason) ->
-    Stacktrace = [case A of
-         { Module,Function,Arity,Location} ->
-             { Module,Function,Arity,proplists:get_value(line, Location) };
-         Else -> Else end
-    || A <- erlang:get_stacktrace()],
+    Stacktrace =
+        [case A of
+             {Module, Function, Arity, Location} ->
+                 Line = proplists:get_value(line, Location),
+                 {Module, Function, Arity, Line};
+             Else -> Else
+         end
+         || A <- erlang:get_stacktrace()],
     [Error, Reason, Stacktrace].
 
 error_page(Class,Error) ->
@@ -125,21 +126,27 @@ error_page(Class,Error) ->
 
 % TIMER
 
-proc(init,#pi{}=Async) ->
+proc(init, #pi{} = Async) ->
     n2o:info(?MODULE,"Proc Init: ~p\r~n",[init]),
     Timer = timer_restart(ping()),
     {ok,Async#pi{state=Timer}};
 
-proc({timer,ping},#pi{state=Timer}=Async) ->
+proc({timer, ping}, #pi{state = Timer} = Async) ->
     erlang:cancel_timer(Timer),
-    n2o:info(?MODULE,"n2o Timer: ~p\r~n",[ping]),
-    n2o:invalidate_cache(caching),
+    n2o:info(?MODULE,"n2o Timer: ~p\r~n",[ping()]),
+    invalidate_cache(caching),
     (n2o_session:storage()):invalidate_sessions(),
-    {reply,ok,Async#pi{state=timer_restart(ping())}}.
+    {reply, ok, Async#pi{state = timer_restart(ping())}}.
 
-invalidate_cache(Table) -> ets:foldl(fun(X,_) -> n2o:cache(Table,element(1,X)) end, 0, Table).
-timer_restart(Diff) -> {X,Y,Z} = Diff, erlang:send_after(1000*(Z+60*Y+60*60*X),self(),{timer,ping}).
-ping() -> application:get_env(n2o,timer,{0,1,0}).
+invalidate_cache(Table) ->
+    ets:foldl(fun(X,_) -> cache(Table, element(1, X)) end, 0, Table).
+
+timer_restart({H, M, S}) ->
+    Secs = 3600 * H + 60 * M + S,
+    erlang:send_after(1000 * Secs, self(), {timer, ping}).
+
+ping() ->
+    application:get_env(n2o, timer, {0, 1, 0}).
 
 % LOG
 
@@ -154,13 +161,20 @@ level(_)       -> 0.
 
 log(M,F,A,Fun) ->
     case level(Fun) < level(log_level()) of
-         true  -> skip;
-         false -> case    log_modules() of
-             any       -> (logger()):Fun(M,F,A);
-             []        -> skip;
-             Allowed   -> case lists:member(M, Allowed) of
-                 true  -> (logger()):Fun(M,F,A);
-                 false -> skip end end end.
+        true  ->
+            skip;
+        false ->
+            case log_modules() of
+                any ->
+                    (logger()):Fun(M, F, A);
+                [] -> skip;
+                Allowed ->
+                    case lists:member(M, Allowed) of
+                        true  -> (logger()):Fun(M,F,A);
+                        false -> skip
+                    end
+            end
+    end.
 
 info   (Module, String, Args) -> log(Module,  String, Args, info).
 warning(Module, String, Args) -> log(Module,  String, Args, warning).

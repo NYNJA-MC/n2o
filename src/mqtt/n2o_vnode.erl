@@ -2,198 +2,168 @@
 -description('N2O MQTT Backend').
 -include("n2o.hrl").
 -include("emqttd.hrl").
--export([proc/2,lst/1]).
--export([get_vnode/1,get_vnode/2,validate/2,send_reply/3,send_reply/4,send/3,send/4]).
--export([subscribe/3,subscribe/2,unsubscribe/3,unsubscribe/2,subscribe_cli/2,unsubscribe_cli/2]).
+-export([proc/2]).
+-export([get_vnode/1,get_vnode/2,validate/2]).
 -export([load/1,unload/0]).
--export([on_client_connected/3, on_client_disconnected/3, on_client_subscribe/4,
-         on_client_unsubscribe/4, on_session_created/3, on_session_subscribed/4,
-         on_session_unsubscribed/4, on_session_terminated/4, on_message_publish/2,
-         on_message_delivered/4, on_message_acked/4 ]).
+-export([on_message_publish/2]).
 
 %% N2O-MQTT Topic Format
 
 %% Client: 1. actions/:vsn/:module/:client
 %% Server: 2. events/:vsn/:node/:module/:user/:client/:token
 
-%% server and client sends
-
-send_reply(ClientId, Topic, Message) -> send_reply(ClientId, 0, Topic, Message).
-send_reply(ClientId, QoS, Topic, Message) ->
-    emqttd:publish(emqttd_message:make(ClientId, QoS, Topic, Message)).
-
-send(C,T,M)      -> send(C, T, M, [{qos,2}]).
-send(C,T,M,Opts) -> emqttc:publish(C, T, M, Opts).
-
 % N2O VNODE SERVER for MQTT
-
-debug(Name,Topic,BERT,Address,Return) ->
-    case application:get_env(n2o,dump_loop,no) of
-         yes -> n2o:info(?MODULE,"VNODE:~p Message on topic ~tp.\r~n", [Name, Topic]),
-                n2o:info(?MODULE,"BERT: ~tp\r~nAddress: ~p\r~n",[BERT,Address]),
-                n2o:info(?MODULE,"on_message_publish: ~s.\r~n", [Topic]),
-                case Return of
-                     {error,R} -> n2o:info(?MODULE,"ERROR: ~p~n",[R]);
-                             _ -> skip
-                end,
-                ok;
-           _ -> skip end.
-
-
-sid() -> application:get_env(n2o,token_as_sid,false).
-fix('')          -> index;
-fix(<<"index">>) -> index;
-fix(Module)      -> list_to_atom(binary_to_list(Module)).
-
-lst(X) -> binary_to_list(n2o:to_binary(X)).
-
-gen_name(Pos) when is_integer(Pos) -> gen_name(integer_to_list(Pos));
-gen_name(Pos) ->
-    Hash = erlang:phash2(node()),
-    iolist_to_binary(io_lib:format("~8.16.0b_~s", [Hash, Pos])).
 
 proc(init,#pi{name=Name}=Async) ->
     n2o:info(?MODULE,"VNode Init: ~p\r~n",[Name]),
-    case catch emqttc:module_info() of
-         {'EXIT',_} -> {ok,Async#pi{state=[]}};
-         _ -> {ok, C} = emqttc:start_link([{host, "127.0.0.1"},
-                            {client_id, gen_name(Name)},
-                            {clean_sess, false},
-                            {logger, {console, error}},
-                            {reconnect, 5}]),
-                  {ok,Async#pi{state=C}} end;
+    {ok, C} = emqttc:start_link([{host, "127.0.0.1"},
+                                 {client_id, gen_name(Name)},
+                                 {clean_sess, false},
+                                 {logger, {console, error}},
+                                 {reconnect, 5}]),
+    {ok,Async#pi{state = C}};
 
-
-proc({publish,_,_}, State=#pi{state=[]}) -> {reply,[],State};
-proc({publish, To, Request},
-    State  = #pi{name=Name,state=C}) ->
-    Addr   = emqttd_topic:words(To),
-    Bert   = n2o:decode(Request),
-    Return = case Addr of
-        [ _Origin, Vsn, Node, Module, _Username, Id, Token | _ ] ->
-        From = n2o:to_binary(["actions/", lst(Vsn), "/", lst(Module), "/", lst(Id)]),
-        Sid  = case sid() of
-                    true -> n2o:to_binary(Token);
-                    false -> case n2o:depickle(n2o:to_binary(Token)) of
-                             {{A,_},_} -> A; B -> B end
-               end,
-        Ctx  = #cx { module=fix(Module), session=Sid, node=Node,
-                     params=Id, client_pid=C, from = From, vsn = Vsn},
-        n2o:info(?MODULE, "n2o(~p): RECV PUBLISH(Topic=~s, Hash=0x~8.16.0b, Payload=~p)", [Name, To, erlang:phash2(Request), Bert]),
-        put(context, Ctx),
-        try case n2o_proto:info(Bert,[],Ctx) of
-                 {reply,{_,      <<>>},_,_}           -> skip;
-                 {reply,{bert,   Term},_,#cx{from=X}} -> {ok, reply(Name, C, X, Term)};
-                 {reply,{json,   Term},_,#cx{from=X}} -> {ok,send(C,X,n2o_json:encode(Term))};
-                 {reply,{binary, Term},_,#cx{from=X}} -> {ok,send(C,X,Term)};
-                 {reply,{default,Term},_,#cx{from=X}} -> {ok,send(C,X,n2o:encode(Term))};
-                 {reply,{Encoder,Term},_,#cx{from=X}} -> {ok,send(C,X,Encoder:encode(Term))};
-                                                Reply -> {error,{"Invalid Return",Reply}}
-            end
-        catch Err:Rea ->
-            n2o:error(?MODULE,"Catch:~p~n",[n2o:stack_trace(Err,Rea)])
-        end;
-        Addr -> {error,{"Unknown Address",Addr}} end,
-    debug(Name,To,Bert,Addr,Return),
-    {reply, Return, State};
-
-proc({mqttc, C, connected}, State=#pi{name=Name,state=C}) ->
-    emqttc:subscribe(C, n2o:to_binary([<<"events/+/">>, lists:concat([Name]),"/#"]), 2),
+proc({mqttc, C, connected}, State = #pi{name = Name, state = C}) ->
+    Topic = n2o:to_binary([<<"events/+/">>, n2o:to_binary(Name), "/#"]),
+    emqttc:subscribe(C, Topic, 2),
     {ok, State};
+
+proc({publish,_,_}, State = #pi{state=[]}) ->
+    {reply, [], State};
+
+proc({publish, To, Request}, State = #pi{name = Name, state = C}) ->
+    Bert = n2o:decode(Request),
+    case emqttd_topic:words(To) of
+        [ _Origin, Vsn, Node, Module, _Username, Id, Token | _ ] = Addr ->
+            From = n2o:to_binary(["actions/", n2o:to_binary(Vsn), "/",
+                                  n2o:to_binary(Module), "/", n2o:to_binary(Id)]),
+            Sid  = token_to_sid(Token),
+            Ctx  = #cx {module = fix_ctx_module(Module), session = Sid,
+                        node = Node, params = Id, client_pid = C, from = From, vsn = Vsn},
+            n2o:info(?MODULE, "n2o(~p): RECV PUBLISH(Topic=~s, Hash=0x~8.16.0b, Payload=~p)",
+                     [Name, To, erlang:phash2(Request), Bert]),
+            put(context, Ctx),
+            try n2o_proto:info(Bert, [], Ctx) of
+                Reply ->
+                    Return = handle_proto_reply(Reply, C, Name),
+                    debug(Name, To, Bert, Addr, Return),
+                    {reply, Return, State}
+            catch
+                Err:Rea ->
+                    n2o:error(?MODULE,"Catch:~p~n",[n2o:stack_trace(Err,Rea)]),
+                    {reply, {error, "Internal error"}, State}
+            end;
+        Addr ->
+            Return = {error, {"Unknown Address", Addr}},
+            debug(Name, To, Bert, Addr, Return),
+            {reply, Return, State}
+    end;
 
 proc(Unknown,Async) ->
     {reply,{uknown,Unknown,0},Async}.
 
-% MQTT HELPERS
+debug(Name, Topic, BERT, Address, Return) ->
+    case application:get_env(n2o, dump_loop, no) of
+        yes ->
+            n2o:info(?MODULE,"VNODE:~p Message on topic ~tp.\r~n", [Name, Topic]),
+            n2o:info(?MODULE,"BERT: ~tp\r~nAddress: ~p\r~n",[BERT,Address]),
+            n2o:info(?MODULE,"on_message_publish: ~s.\r~n", [Topic]),
+            case Return of
+                {error, R} ->
+                    n2o:info(?MODULE,"ERROR: ~p~n",[R]);
+                _ ->
+                    skip
+            end,
+            ok;
+        _ ->
+            skip
+    end.
 
-reply(N2OName, MqttClient, Topic, Response) ->
-    %%n2o:info(?MODULE, "n2o(~p): SEND PUBLISH(Topic=~s, Payload=~p)", [N2OName, Topic, Response]),
-    send(MqttClient, Topic, n2o_bert:encode(Response)).
+gen_name(Pos) when is_integer(Pos) ->
+    gen_name(integer_to_list(Pos));
+gen_name(Pos) ->
+    Hash = erlang:phash2(node()),
+    iolist_to_binary(io_lib:format("~8.16.0b_~s", [Hash, Pos])).
 
-subscribe(X,Y) -> subscribe(X,Y,[{qos,2}]).
-subscribe(X,Y,[{qos,Z}]) -> subscribe_cli(X,[{Y,Z}]).
+fix_ctx_module('')          -> index;
+fix_ctx_module(<<"index">>) -> index;
+fix_ctx_module(Module)      -> list_to_atom(binary_to_list(Module)).
 
-unsubscribe(X,Y) -> unsubscribe(X,Y,[{qos,2}]).
-unsubscribe(X,Y,[{qos,Z}]) -> unsubscribe_cli(X,[{Y,Z}]).
+token_to_sid(Token) ->
+    case application:get_env(n2o, token_as_sid, false) of
+        true ->
+            n2o:to_binary(Token);
+        false ->
+            case n2o:depickle(n2o:to_binary(Token)) of
+                {{A,_},_} -> A;
+                B -> B
+            end
+    end.
 
-subscribe_cli(ClientId, TopicTable) ->
-    [ emqttd_pubsub:subscribe(Topic,ClientId,[{qos,Qos}])
-      || {Topic,Qos} <- TopicTable ].
+handle_proto_reply({reply, {_, <<>>}, _, _Ctx}, _MqttClient, _Name) ->
+    skip;
+handle_proto_reply({reply, {Encoder, Term}, _, #cx{from = From}}, MqttClient, Name) ->
+    Reply = encode_proto_reply(Encoder, Term),
+    {ok, emqttc:publish(MqttClient, From, Reply, [{qos, 2}])};
+handle_proto_reply(Reply, _MqttClient, _Name) ->
+    {error, {"Invalid Return", Reply}}.
 
-unsubscribe_cli(ClientId, TopicTable)->
-    [case ets:lookup(mqtt_subproperty, {Topic, ClientId}) of
-         [{mqtt_subproperty, _, Options}] ->
-             emqttd_pubsub:unsubscribe(Topic, ClientId, Options);
-         [] ->
-             ok
-     end || {Topic,_Qos} <- TopicTable ].
+encode_proto_reply(bert,    Term) -> n2o_bert:encode(Term);
+encode_proto_reply(json,    Term) -> n2o_json:encode(Term);
+encode_proto_reply(binary,  Term) -> Term;
+encode_proto_reply(default, Term) -> n2o:encode(Term);
+encode_proto_reply(Encoder, Term) -> Encoder:encode(Term).
 
 % MQTT HOOKS
 
 load(Env) ->
-    emqttd:hook('client.connected',    fun ?MODULE:on_client_connected/3,     [Env]),
-    emqttd:hook('client.disconnected', fun ?MODULE:on_client_disconnected/3,  [Env]),
-    emqttd:hook('client.subscribe',    fun ?MODULE:on_client_subscribe/4,     [Env]),
-    emqttd:hook('client.unsubscribe',  fun ?MODULE:on_client_unsubscribe/4,   [Env]),
-    emqttd:hook('session.created',     fun ?MODULE:on_session_created/3,      [Env]),
-    emqttd:hook('session.subscribed',  fun ?MODULE:on_session_subscribed/4,   [Env]),
-    emqttd:hook('session.unsubscribed',fun ?MODULE:on_session_unsubscribed/4, [Env]),
-    emqttd:hook('session.terminated',  fun ?MODULE:on_session_terminated/4,   [Env]),
-    emqttd:hook('message.publish',     fun ?MODULE:on_message_publish/2,      [Env]),
-    emqttd:hook('message.delivered',   fun ?MODULE:on_message_delivered/4,    [Env]),
-    emqttd:hook('message.acked',       fun ?MODULE:on_message_acked/4,        [Env]).
+    emqttd:hook('message.publish', fun ?MODULE:on_message_publish/2, [Env]).
 
 unload() ->
-    emqttd:unhook('client.connected',     fun ?MODULE:on_client_connected/3),
-    emqttd:unhook('client.disconnected',  fun ?MODULE:on_client_disconnected/3),
-    emqttd:unhook('client.subscribe',     fun ?MODULE:on_client_subscribe/4),
-    emqttd:unhook('client.unsubscribe',   fun ?MODULE:on_client_unsubscribe/4),
-    emqttd:unhook('session.subscribed',   fun ?MODULE:on_session_subscribed/4),
-    emqttd:unhook('session.unsubscribed', fun ?MODULE:on_session_unsubscribed/4),
-    emqttd:unhook('message.publish',      fun ?MODULE:on_message_publish/2),
-    emqttd:unhook('message.delivered',    fun ?MODULE:on_message_delivered/4),
-    emqttd:unhook('message.acked',        fun ?MODULE:on_message_acked/4).
+    emqttd:unhook('message.publish', fun ?MODULE:on_message_publish/2).
 
-on_client_connected(_ConnAck, Client=#mqtt_client{client_id= <<"emqttc",_/bytes>>}, _) -> {ok, Client};
-on_client_connected(_ConnAck, Client = #mqtt_client{}, _Env) -> {ok, Client}.
-on_client_disconnected(_Reason, _Client = #mqtt_client{}, _Env) -> ok.
-on_client_subscribe(_ClientId, _Username, TopicTable, _Env) -> {ok, TopicTable}.
-on_client_unsubscribe(_ClientId, _Username, TopicTable, _Env) -> {ok, TopicTable}.
-on_session_created(_ClientId, _Username, _Env) -> ok.
-on_session_subscribed(<<"emqttd",_/binary>>,_,{<<"actions/",_, "/",_/binary>> =Topic,Opts},_) -> {ok,{Topic,Opts}};
-on_session_subscribed(_ClientId, _Username, {Topic, Opts}, _Env) -> {ok, {Topic,Opts}}.
-on_session_unsubscribed(_ClientId, _Username, {_Topic, _Opts}, _Env) -> ok.
-on_session_terminated(_ClientId, _Username, _Reason, _Env) -> ok.
-on_message_delivered(_ClientId, _Username, Message, _Env) -> {ok,Message}.
-on_message_acked(_ClientId, _Username, Message, _Env) -> {ok,Message}.
-on_message_publish(Message = #mqtt_message{topic = <<"actions/", _/binary>>, from=_From}, _Env) -> {ok, Message};
-on_message_publish(#mqtt_message{topic = <<"events/", _TopicTail/binary>> = Topic, qos=Qos,
-    from={ClientId,_},payload = Payload}=Message, _Env) ->
+on_message_publish(Message = #mqtt_message{topic = <<"actions/", _/binary>>, from=_From}, _Env) ->
+    {ok, Message};
+on_message_publish(#mqtt_message{topic = <<"events/", _TopicTail/binary>> = Topic,
+                                 qos = Qos, from = {ClientId,_},
+                                 payload = Payload} = Message, _Env) ->
     {Module, ValidateFun} = application:get_env(n2o, validate, {?MODULE, validate}),
     case Module:ValidateFun(Payload, ClientId) of
         ok ->
             case emqttd_topic:words(Topic) of
                 [E, V, '', M, U, _C, T] ->
+                    %% The vnode is not given. Redirect it to a vnode.
                     {Mod, F} = application:get_env(n2o, vnode, {?MODULE, get_vnode}),
                     NewTopic = emqttd_topic:join([E, V, Mod:F(ClientId, Payload), M, U, ClientId, T]),
                     NewMessage = emqttd_message:make(ClientId, Qos, NewTopic, Payload),
                     {ok, NewMessage};
-                %% @NOTE redirect to vnode
-                [_E, _V, _N, _M, _U, ClientId, _T] -> {ok, Message};
+                [_E, _V, _N, _M, _U, ClientId, _T] ->
+                    %% A vnode is given, and the ClientId is correct
+                    {ok, Message};
                 [E, V, N, M, U, _C, T] ->
+                    %% A vnode is given, but the ClientId is not correct.
+                    %% Patch it.
                     NewTopic = emqttd_topic:join([E, V, N, M, U, ClientId, T]),
                     NewMessage = emqttd_message:make(ClientId, Qos, NewTopic, Payload),
                     {ok, NewMessage};
                 %% @NOTE redirect to event topic with correct ClientId
-                _ -> {ok, Message}
+                _ ->
+                    {ok, Message}
             end;
-        {error, ErrMessage} -> {ok, ErrMessage};
-        _ -> ok end;
-on_message_publish(_Message, _) -> ok.
+        {error, ErrMessage} ->
+            {ok, ErrMessage};
+        _ ->
+            ok
+    end;
+on_message_publish(_Message, _) ->
+    ok.
 
-get_vnode(ClientId) -> get_vnode(ClientId, []).
+get_vnode(ClientId) ->
+    get_vnode(ClientId, []).
+
 get_vnode(ClientId, _) ->
     [H|_] = binary_to_list(erlang:md5(ClientId)),
     integer_to_binary(H rem (length(n2o:ring())) + 1).
 
-validate(_Payload, _ClientId) -> ok.
+validate(_Payload, _ClientId) ->
+    ok.
